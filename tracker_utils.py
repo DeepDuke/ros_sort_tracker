@@ -9,6 +9,7 @@ from sklearn.utils.linear_assignment_ import linear_assignment
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from darknet_ros_msgs.msg import BoundingBox, BoundingBoxes
 
 
@@ -95,6 +96,11 @@ class KalmanBoxTracker(object):
         self.hits = 0
         self.hit_streak = 0
         self.age = 0
+        # tracker positions and velocities
+        self.pos = np.array([0.0, 0.0, 0.0])
+        self.vel = np.array([0.0, 0.0, 0.0])
+        self.update_pos_vel_time = time.time()
+        self.first_detected = True
 
     def update(self, bbox):
         """
@@ -125,6 +131,20 @@ class KalmanBoxTracker(object):
     Returns the current bounding box estimate.
     """
         return convert_x_to_bbox(self.kf.x)
+
+    def update_pos_and_vel(self, pos_vec):
+        """
+        @param pos_vec: np.array([x, y, z])
+        """
+        last_pos = self.pos
+        self.pos = pos_vec
+        new_time = time.time()
+        time_delta = new_time - self.update_pos_vel_time
+        self.update_pos_vel_time = new_time
+        if self.first_detected == True:
+            self.first_detected = False
+        else:
+            self.vel = (self.pos - last_pos) / time_delta
 
 
 def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
@@ -232,14 +252,24 @@ class Sort(object):
 
 MOT = Sort()
 bridge = CvBridge()
-result_pub = rospy.Publisher("tracker_utils_result", Image, queue_size=1)
+result_image_pub = rospy.Publisher('/tracker/image_result',
+                                   Image,
+                                   queue_size=1)
+obstacles_pub = rospy.Publisher('/tracker/obstacles_information',
+                                String,
+                                queue_size=1)
 
 
 def callback(color_image_msg, depth_image_msg, bboxes_msg):
     rospy.loginfo('Enter callback function ...')
-    # convert color_image into color_cv_image
+    # convert color_image_msg into color_cv_image
     try:
         color_cv_image = bridge.imgmsg_to_cv2(color_image_msg, 'bgr8')
+    except CvBridgeError as error:
+        print(error)
+    # convert depth_image_msg into depth_cv_image
+    try:
+        depth_cv_image = bridge.imgmsg_to_cv2(depth_image_msg)
     except CvBridgeError as error:
         print(error)
     # pick up bboxes from bboxes_msg
@@ -250,19 +280,36 @@ def callback(color_image_msg, depth_image_msg, bboxes_msg):
     # update trackers
     detections = np.array(detections)
     MOT.update(detections)
+
+    obstacles_info = ''
     # draw tracker's state on color_cv_image, and show their ids
     for tracker in MOT.trackers:
+        # global obstacles_info
         bbox = tracker.get_state()[0]  # [x1,y1,x2,y2]
         bbox = list(map(int, bbox))
-        id = 'ID: ' + str(tracker.id)
+        text = 'ID: ' + str(tracker.id) + ' W: {} px'.format(bbox[3] - bbox[1])
         cv2.rectangle(color_cv_image,
                       pt1=(bbox[0], bbox[1]),
                       pt2=(bbox[2], bbox[3]),
                       color=(0, 0, 0),
                       thickness=2)
+        # update tracker's pos and vel
+        bbox_center_x = int((bbox[0] + bbox[2]) / 2)
+        bbox_center_y = int((bbox[1] + bbox[3]) / 2)
+        # TODO: using camera intrinsics to calculate
+        pos_vec = np.array(
+            [0.0, 0.0, depth_cv_image[bbox_center_y, bbox_center_x]])
+        tracker.update_pos_and_vel(pos_vec)
+        # fill obstacles_info
 
+        obstacles_info += '{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f};'.format(
+            tracker.id, tracker.pos[0], tracker.pos[1], tracker.pos[2],
+            tracker.vel[0], tracker.vel[1], tracker.vel[2])
+        # draw obstacle depth and vel on color_cv_image
+        text += ' Dist:{:.2f} m Vel:{:.2f} m/s'.format(tracker.pos[2]/1000.0,
+                                                 tracker.vel[2]/1000.0)
         cv2.putText(color_cv_image,
-                    id,
+                    text,
                     org=(bbox[0], bbox[1] - 5),
                     fontFace=1,
                     fontScale=1,
@@ -271,9 +318,11 @@ def callback(color_image_msg, depth_image_msg, bboxes_msg):
                     lineType=cv2.LINE_AA)
     # publish track result image
     try:
-        result_pub.publish(bridge.cv2_to_imgmsg(color_cv_image, 'bgr8'))
+        result_image_pub.publish(bridge.cv2_to_imgmsg(color_cv_image, 'bgr8'))
     except CvBridgeError as error:
         print(error)
+    # publish obstacles info
+    obstacles_pub.publish(String(obstacles_info))
 
 
 if __name__ == '__main__':
