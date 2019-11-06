@@ -7,6 +7,7 @@ def get_colors(n):
     """
     @param n: number of OpenCV format colors to generate
     """
+    random.seed(1)
     colors = []
     R = int(random.random() * 256)
     G = int(random.random() * 256)
